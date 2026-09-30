@@ -22,6 +22,19 @@ for (const key of requiredEnv) {
   }
 }
 
+// Status option IDs from GitHub Project (optional – fallback to BACKLOG_OPTION_ID)
+const STATUS_OPTIONS = {
+  todo:
+    process.env.TODO_OPTION_ID ||
+    process.env.BACKLOG_OPTION_ID,
+  inprogress:
+    process.env.IN_PROGRESS_OPTION_ID ||
+    process.env.BACKLOG_OPTION_ID,
+  done:
+    process.env.DONE_OPTION_ID ||
+    process.env.BACKLOG_OPTION_ID,
+};
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -120,6 +133,53 @@ function isCommand(text, names) {
   const normalized = (text || "").toLowerCase().trim();
   const base = normalized.split("@")[0];
   return names.some((name) => base === name || normalized === name);
+}
+
+/**
+ * Parse status commands: /todo, /inprogress, /inprogres, /done
+ * Examples:
+ *   /done Fix login bug
+ *   /inprogress Working on API
+ *   /todo New feature
+ * Returns null if not a status command.
+ */
+function parseStatusCommand(text) {
+  const raw = (text || "").trim();
+  if (!raw.startsWith("/")) return null;
+
+  // Remove bot mention: /done@mybot → /done
+  const withoutMention = raw.replace(/^\/([a-zA-Z]+)@[^\s]+/, "/$1");
+  const match = withoutMention.match(
+    /^\/(todo|inprogress|inprogres|done)(?:\s+([\s\S]*))?$/i
+  );
+
+  if (!match) return null;
+
+  const cmd = match[1].toLowerCase();
+  const rest = (match[2] || "").trim();
+
+  const map = {
+    todo: { key: "todo", label: "Todo", optionId: STATUS_OPTIONS.todo },
+    inprogress: {
+      key: "inprogress",
+      label: "In Progress",
+      optionId: STATUS_OPTIONS.inprogress,
+    },
+    inprogres: {
+      key: "inprogress",
+      label: "In Progress",
+      optionId: STATUS_OPTIONS.inprogress,
+    },
+    done: { key: "done", label: "Done", optionId: STATUS_OPTIONS.done },
+  };
+
+  const status = map[cmd];
+  if (!status) return null;
+
+  return {
+    ...status,
+    taskText: rest,
+  };
 }
 
 function sessionMarker(chatKey) {
@@ -327,7 +387,10 @@ async function addMessageToCombineSession(ctx) {
     publicImageUrl,
   };
 
-  await addCommentToIssue(session.id, "```json\n" + JSON.stringify(item) + "\n```");
+  await addCommentToIssue(
+    session.id,
+    "```json\n" + JSON.stringify(item) + "\n```"
+  );
 
   const itemCount = (session.comments?.nodes?.length || 0) + 1;
   return itemCount;
@@ -378,14 +441,18 @@ Has image: ${item.publicImageUrl ? "Yes" : "No"}
 Original message:
 ${item.text || "No text"}
 
-${item.publicImageUrl ? '<img width="884" alt="Image" src="' + item.publicImageUrl + '" />' : ""}`;
+${
+  item.publicImageUrl
+    ? '<img width="884" alt="Image" src="' + item.publicImageUrl + '" />'
+    : ""
+}`;
   })
   .join("\n\n")}`;
 
   const issue = await createIssue(title, issueBody);
 
   const itemId = await addIssueToProject(issue.id);
-  await setStatusToBacklog(itemId);
+  await setStatus(itemId, STATUS_OPTIONS.todo);
 
   await closeIssue(session.id);
 
@@ -415,7 +482,7 @@ async function addIssueToProject(issueId) {
   return result.addProjectV2ItemById.item.id;
 }
 
-async function setStatusToBacklog(itemId) {
+async function setStatus(itemId, optionId) {
   await github(
     `
     mutation(
@@ -442,13 +509,19 @@ async function setStatusToBacklog(itemId) {
       projectId: process.env.PROJECT_ID,
       itemId,
       fieldId: process.env.STATUS_FIELD_ID,
-      optionId: process.env.BACKLOG_OPTION_ID,
+      optionId: optionId || process.env.BACKLOG_OPTION_ID,
     }
   );
 }
 
-async function createBacklogTask(ctx) {
-  const text = getTaskText(ctx);
+async function createBacklogTask(ctx, options = {}) {
+  const {
+    taskText = null,
+    statusOptionId = STATUS_OPTIONS.todo,
+    statusLabel = "Todo",
+  } = options;
+
+  const text = taskText !== null ? taskText : getTaskText(ctx);
   const senderName = getSenderName(ctx);
   const chatName = getChatName(ctx);
   const forwardedFrom = getForwardedFrom(ctx);
@@ -466,16 +539,21 @@ async function createBacklogTask(ctx) {
   const issueBody = `Chat: ${chatName}
 Sent by: ${senderName}
 Forwarded from: ${forwardedFrom}
+Status: ${statusLabel}
 
 Original message:
 ${text || "No text"}
 
-${publicImageUrl ? '<img width="884" alt="Image" src="' + publicImageUrl + '" />' : ""}`;
+${
+  publicImageUrl
+    ? '<img width="884" alt="Image" src="' + publicImageUrl + '" />'
+    : ""
+}`;
 
   const issue = await createIssue(title, issueBody);
 
   const itemId = await addIssueToProject(issue.id);
-  await setStatusToBacklog(itemId);
+  await setStatus(itemId, statusOptionId);
 
   return {
     issue,
@@ -483,18 +561,33 @@ ${publicImageUrl ? '<img width="884" alt="Image" src="' + publicImageUrl + '" />
     chatName,
     forwardedFrom,
     publicImageUrl,
+    statusLabel,
   };
 }
 
 bot.start((ctx) => {
   ctx.reply(
-    "Bot active ✅\n\nWithout /combine each message becomes a separate task.\nWith /combine I collect messages, then /stop creates one combined task."
+    "Bot active ✅\n\n" +
+      "Send text/photo → task in Todo\n" +
+      "/todo text → Todo\n" +
+      "/inprogress text → In Progress\n" +
+      "/done text → Done\n\n" +
+      "/combine → collect messages, /stop → 1 combined task"
   );
 });
 
 bot.command("help", (ctx) => {
   ctx.reply(
-    "Without /combine: each message/image becomes a separate task.\n\nWith /combine:\n1. Send /combine\n2. Forward messages/images\n3. Send /stop to create 1 combined task\n\nTo cancel without creating a task, send /cancel."
+    "Commands:\n\n" +
+      "• text / photo → create task in Todo\n" +
+      "• /todo <text> → Todo column\n" +
+      "• /inprogress <text> (or /inprogres) → In Progress\n" +
+      "• /done <text> → Done column\n\n" +
+      "Combine mode:\n" +
+      "1. /combine\n" +
+      "2. Forward messages/images\n" +
+      "3. /stop → 1 combined task\n" +
+      "• /cancel → cancel combine"
   );
 });
 
@@ -504,6 +597,7 @@ bot.on(["text", "photo", "document"], async (ctx) => {
 
   if (ctx.message?.from?.is_bot) return;
 
+  // /combine
   if (isCommand(rawText, ["/combine", "/combin"])) {
     try {
       await startCombineSession(ctx);
@@ -516,6 +610,7 @@ bot.on(["text", "photo", "document"], async (ctx) => {
     }
   }
 
+  // /cancel
   if (isCommand(rawText, ["/cancel"])) {
     try {
       const cancelled = await cancelCombineSession(ctx);
@@ -529,13 +624,16 @@ bot.on(["text", "photo", "document"], async (ctx) => {
     }
   }
 
+  // /stop
   if (isCommand(rawText, ["/stop"])) {
     try {
       await ctx.reply("⏳ Creating combined task...");
       const issue = await createCombinedBacklogTask(ctx);
 
       if (!issue) {
-        return ctx.reply("⚠️ No messages/images to combine. Send /combine first.");
+        return ctx.reply(
+          "⚠️ No messages/images to combine. Send /combine first."
+        );
       }
 
       return ctx.reply(
@@ -547,9 +645,45 @@ bot.on(["text", "photo", "document"], async (ctx) => {
     }
   }
 
+  // /todo, /inprogress, /done  (+ optional text / photo caption)
+  const statusCmd = parseStatusCommand(rawText);
+  if (statusCmd) {
+    const taskText = statusCmd.taskText;
+    const hasContent = Boolean(taskText) || hasImage;
+
+    if (!hasContent) {
+      return ctx.reply(
+        `⚠️ Usage: /${statusCmd.key} <text>\nOr send a photo with caption /${statusCmd.key} description`
+      );
+    }
+
+    try {
+      await ctx.reply(`⏳ Creating task in ${statusCmd.label}...`);
+
+      const { issue, senderName, chatName, publicImageUrl, statusLabel } =
+        await createBacklogTask(ctx, {
+          taskText: taskText || (hasImage ? "Image sent" : ""),
+          statusOptionId: statusCmd.optionId,
+          statusLabel: statusCmd.label,
+        });
+
+      return ctx.reply(
+        `✅ Task added to ${statusLabel}:\n\n#${issue.number} ${issue.title}\n👤 From: ${senderName}\n💬 Chat: ${chatName}${
+          publicImageUrl ? "\n🖼 Image shown in task" : ""
+        }\n\n${issue.url}`
+      );
+    } catch (error) {
+      console.error("Status command error:", error);
+      return ctx.reply(
+        "❌ Error creating task. Check GitHub, Telegram and Cloudinary tokens."
+      );
+    }
+  }
+
   if (!rawText && !hasImage) return;
 
   try {
+    // Active combine session?
     const itemCount = await addMessageToCombineSession(ctx);
 
     if (itemCount !== null) {
@@ -558,13 +692,17 @@ bot.on(["text", "photo", "document"], async (ctx) => {
       );
     }
 
+    // Ignore other unknown commands
     if (rawText.startsWith("/")) return;
 
+    // Default → Todo
     const { issue, senderName, chatName, publicImageUrl } =
       await createBacklogTask(ctx);
 
     await ctx.reply(
-      `✅ Task added to Backlog:\n\n#${issue.number} ${issue.title}\n👤 From: ${senderName}\n💬 Chat: ${chatName}${publicImageUrl ? "\n🖼 Image shown in task" : ""}\n\n${issue.url}`
+      `✅ Task added to Todo:\n\n#${issue.number} ${issue.title}\n👤 From: ${senderName}\n💬 Chat: ${chatName}${
+        publicImageUrl ? "\n🖼 Image shown in task" : ""
+      }\n\n${issue.url}`
     );
   } catch (error) {
     console.error("GitHub/Telegram error:", error);
