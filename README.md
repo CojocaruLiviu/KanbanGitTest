@@ -363,7 +363,7 @@ Telegram images are uploaded here so they can be displayed publicly inside GitHu
 
 ---
 
-## 9. Step 6 – The `.env` file
+## 9. Step 6 – The `.env` file for VERCEL
 
 1. Copy the example file:
    ```bash
