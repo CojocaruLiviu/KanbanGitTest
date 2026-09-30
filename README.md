@@ -11,17 +11,18 @@ Suportă și **modul combinare**: aduni mai multe mesaje/imagini și le transfor
 1. [Ce face botul](#1-ce-face-botul)
 2. [Cerințe](#2-cerințe)
 3. [Structura proiectului](#3-structura-proiectului)
-4. [Pasul 1 – Creează botul Telegram](#4-pasul-1--creează-botul-telegram)
-5. [Pasul 2 – Token GitHub](#5-pasul-2--token-github)
-6. [Pasul 3 – ID-urile Project V2](#6-pasul-3--id-urile-project-v2)
-7. [Pasul 4 – Cont Cloudinary](#7-pasul-4--cont-cloudinary)
-8. [Pasul 5 – Fișierul `.env`](#8-pasul-5--fișierul-env)
-9. [Pasul 6 – Instalare locală](#9-pasul-6--instalare-locală)
-10. [Pasul 7 – Test local (cu ngrok)](#10-pasul-7--test-local-cu-ngrok)
-11. [Pasul 8 – Deploy pe Vercel](#11-pasul-8--deploy-pe-vercel)
-12. [Pasul 9 – Setare Webhook Telegram](#12-pasul-9--setare-webhook-telegram)
-13. [Comenzi bot](#13-comenzi-bot)
-14. [Troubleshooting](#14-troubleshooting)
+4. [Pasul 1 – Creează Kanban-ul (GitHub Project)](#4-pasul-1--creează-kanban-ul-github-project)
+5. [Pasul 2 – Creează botul Telegram](#5-pasul-2--creează-botul-telegram)
+6. [Pasul 3 – Token GitHub](#6-pasul-3--token-github)
+7. [Pasul 4 – ID-urile Project V2](#7-pasul-4--id-urile-project-v2)
+8. [Pasul 5 – Cont Cloudinary](#8-pasul-5--cont-cloudinary)
+9. [Pasul 6 – Fișierul `.env`](#9-pasul-6--fișierul-env)
+10. [Pasul 7 – Instalare locală](#10-pasul-7--instalare-locală)
+11. [Pasul 8 – Test local (cu ngrok)](#11-pasul-8--test-local-cu-ngrok)
+12. [Pasul 9 – Deploy pe Vercel](#12-pasul-9--deploy-pe-vercel)
+13. [Pasul 10 – Setare Webhook Telegram](#13-pasul-10--setare-webhook-telegram)
+14. [Comenzi bot](#14-comenzi-bot)
+15. [Troubleshooting](#15-troubleshooting)
 
 ---
 
@@ -65,7 +66,61 @@ Issue-ul este adăugat automat în **GitHub Project** cu statusul **Backlog**.
 
 ---
 
-## 4. Pasul 1 – Creează botul Telegram
+## 4. Pasul 1 – Creează Kanban-ul (GitHub Project)
+
+Cel mai simplu mod de a avea un Kanban pe GitHub este prin **GitHub Projects**.
+
+### 4.1 Creează proiectul
+
+1. Intră pe [GitHub Projects](https://github.com/users/USERNAME/projects) (înlocuiește `USERNAME` cu username-ul tău)  
+   sau: profil → tab **Projects** → **New project**
+2. Apasă **New project**
+3. Alege tipul **Board**
+4. Introdu un nume, de exemplu:
+   ```
+   PandaTur Tasks
+   ```
+5. Apasă **Create project**
+
+Vei avea automat coloane de tip:
+
+- **Todo**
+- **In Progress**
+- **Done**
+
+Poți redenumi coloanele (ex: `Backlog`, `In Progress`, `Done`) din setările câmpului **Status**.
+
+### 4.2 Leagă Kanban-ul de repository
+
+Ca issue-urile create de bot să apară în acest Project:
+
+1. Deschide proiectul creat
+2. Click pe **⋯** (meniu) → **Settings**
+3. La secțiunea **Linked repositories** (sau **Manage access** / **Linked repositories**):
+   - Apasă **Link a repository**
+   - Selectează repository-ul tău (ex: `GITHUB_OWNER/GITHUB_REPO`)
+4. Salvează
+
+Alternativ, din repository:
+
+1. Intră pe repository → tab **Projects**
+2. Click **Link a project** → selectează proiectul creat
+
+### 4.3 (Opțional) Adaugă coloana Backlog
+
+Dacă vrei o coloană explicită **Backlog**:
+
+1. În Project → click pe câmpul **Status** (sau **+** pentru câmp nou)
+2. Adaugă o opțiune nouă numită `Backlog`
+3. Trage-o pe prima poziție
+
+> ID-ul acestei opțiuni (`BACKLOG_OPTION_ID`) îl vei folosi mai târziu în `.env`.
+
+Acum poți crea issue-uri manual din Kanban cu **+ Add item → Create new issue**, iar botul le va crea automat.
+
+---
+
+## 5. Pasul 2 – Creează botul Telegram
 
 1. Deschide Telegram și caută **[@BotFather](https://t.me/BotFather)**
 2. Trimite comanda:
@@ -82,7 +137,7 @@ Issue-ul este adăugat automat în **GitHub Project** cu statusul **Backlog**.
 
 ---
 
-## 5. Pasul 2 – Token GitHub
+## 6. Pasul 3 – Token GitHub
 
 1. Mergi pe GitHub → **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**
 2. Click **Generate new token (classic)**
@@ -97,7 +152,7 @@ Issue-ul este adăugat automat în **GitHub Project** cu statusul **Backlog**.
 
 ---
 
-## 6. Pasul 3 – ID-urile Project V2
+## 7. Pasul 4 – ID-urile Project V2
 
 Ai nevoie de 3 valori:
 
@@ -109,14 +164,141 @@ Ai nevoie de 3 valori:
 
 ### Cum le afli
 
-1. Deschide [GitHub GraphQL Explorer](https://docs.github.com/en/graphql/overview/explorer)
-2. Autentifică-te cu token-ul tău
-3. Rulează următoarea query (înlocuiește valorile):
+> **Notă:** GitHub a scos GraphQL Explorer-ul din documentație (noiembrie 2025).  
+> Folosește una din metodele de mai jos.
+
+#### Metoda 1 – GitHub CLI (cea mai simplă)
+
+**1. Instalează GitHub CLI**
+
+```powershell
+# Windows (PowerShell)
+winget install GitHub.cli
+
+# macOS
+brew install gh
+
+# Linux – vezi https://cli.github.com/
+```
+
+**2. Autentifică-te**
+
+```powershell
+gh auth login
+```
+
+Răspunde la întrebări astfel:
+
+```
+? Where do you use GitHub? GitHub.com
+? What is your preferred protocol for Git operations on this host? HTTPS
+? Authenticate Git with your GitHub credentials? Yes
+? How would you like to authenticate GitHub CLI? Login with a web browser
+```
+
+Se deschide browser-ul → introduci codul one-time → confirmi.  
+La final ar trebui să vezi:
+
+```
+✓ Authentication complete.
+✓ Logged in as YourUsername
+```
+
+**3. Rulează query-ul** (înlocuiește `YourUsername` și numărul proiectului):
+
+```powershell
+gh api graphql -f query='
+query {
+  user(login: "YourUsername") {
+    projectV2(number: 1) {
+      id
+      title
+      field(name: "Status") {
+        ... on ProjectV2SingleSelectField {
+          id
+          name
+          options {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+}'
+```
+
+Dacă proiectul e al unei **organizații**, folosește:
+
+```powershell
+gh api graphql -f query='
+query {
+  organization(login: "YourOrgName") {
+    projectV2(number: 1) {
+      id
+      title
+      field(name: "Status") {
+        ... on ProjectV2SingleSelectField {
+          id
+          name
+          options {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+}'
+```
+
+**4. Exemplu de răspuns (date fictive)**
+
+```json
+{
+  "data": {
+    "user": {
+      "projectV2": {
+        "id": "PVT_kwDOABC123xxxxxxxx",
+        "title": "PandaTur Tasks",
+        "field": {
+          "id": "PVTSSF_lADOABC123xxxxxxxx",
+          "name": "Status",
+          "options": [
+            { "id": "f75ad846", "name": "Backlog" },
+            { "id": "47fc9ee4", "name": "Todo" },
+            { "id": "98236672", "name": "In Progress" },
+            { "id": "d2317e8c", "name": "Done" }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Din acest exemplu ai pune în `.env`:
+
+```env
+PROJECT_ID=PVT_kwDOABC123xxxxxxxx
+STATUS_FIELD_ID=PVTSSF_lADOABC123xxxxxxxx
+BACKLOG_OPTION_ID=f75ad846
+```
+
+#### Metoda 2 – Client GraphQL (Insomnia / Altair / Postman)
+
+1. Endpoint: `https://api.github.com/graphql`
+2. Method: `POST`
+3. Header:
+   ```
+   Authorization: Bearer ghp_TOKENUL_TAU
+   ```
+4. Body (GraphQL query):
 
 ```graphql
 query {
-  user(login: "GITHUB_OWNER") {          # sau organization(login: "ORG_NAME")
-    projectV2(number: 1) {               # numărul proiectului din URL
+  user(login: "GITHUB_OWNER") {
+    projectV2(number: 1) {
       id
       title
       field(name: "Status") {
@@ -134,17 +316,18 @@ query {
 }
 ```
 
-4. Din răspuns:
-   - `projectV2.id` → `PROJECT_ID` (ex: `PVT_kwDOA...`)
-   - `field.id` → `STATUS_FIELD_ID` (ex: `PVTSSF_lADOA...`)
-   - din `options`, găsește cea cu `"name": "Backlog"` → `BACKLOG_OPTION_ID` (ex: `f75ad846`)
+#### Ce extragi din răspuns
+
+- `projectV2.id` → `PROJECT_ID` (ex: `PVT_kwDOA...`)
+- `field.id` → `STATUS_FIELD_ID` (ex: `PVTSSF_lADOA...`)
+- din `options`, găsește cea cu `"name": "Backlog"` (sau `"Todo"`) → `BACKLOG_OPTION_ID` (ex: `f75ad846`)
 
 > Numărul proiectului îl găsești în URL:  
 > `https://github.com/users/USERNAME/projects/1` → numărul este `1`.
 
 ---
 
-## 7. Pasul 4 – Cont Cloudinary
+## 8. Pasul 5 – Cont Cloudinary
 
 1. Creează cont pe [cloudinary.com](https://cloudinary.com) (plan free e suficient)
 2. Mergi la **Settings** → **API Keys**
@@ -157,7 +340,7 @@ Imaginile din Telegram sunt încărcate aici ca să poată fi afișate public î
 
 ---
 
-## 8. Pasul 5 – Fișierul `.env`
+## 9. Pasul 6 – Fișierul `.env`
 
 1. Copiază fișierul exemplu:
    ```bash
@@ -190,7 +373,7 @@ CLOUDINARY_API_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ---
 
-## 9. Pasul 6 – Instalare locală
+## 10. Pasul 7 – Instalare locală
 
 ```bash
 # clonează repository-ul
@@ -203,7 +386,7 @@ npm install
 
 ---
 
-## 10. Pasul 7 – Test local (cu ngrok)
+## 11. Pasul 8 – Test local (cu ngrok)
 
 1. Pornește botul:
    ```bash
@@ -231,7 +414,7 @@ npm install
 
 ---
 
-## 11. Pasul 8 – Deploy pe Vercel
+## 12. Pasul 9 – Deploy pe Vercel
 
 ### Varianta A – Prin UI (recomandat)
 
@@ -311,7 +494,7 @@ După deploy vei primi un URL de forma:
 
 ---
 
-## 12. Pasul 9 – Setare Webhook Telegram
+## 13. Pasul 10 – Setare Webhook Telegram
 
 Înlocuiește valorile și rulează:
 
@@ -340,7 +523,7 @@ Răspunsul trebuie să conțină:
 
 ---
 
-## 13. Comenzi bot
+## 14. Comenzi bot
 
 | Comandă | Descriere |
 |---------|-----------|
@@ -363,7 +546,7 @@ Fiecare text, poză sau document-imagine devine un **issue separat**.
 
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 | Problemă | Cauză probabilă | Soluție |
 |----------|-----------------|---------|
