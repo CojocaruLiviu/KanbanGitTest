@@ -37,6 +37,7 @@ const github = graphql.defaults({
 });
 
 let repositoryIdCache = null;
+const combineSessions = new Map();
 
 async function getRepositoryId() {
   if (repositoryIdCache) return repositoryIdCache;
@@ -67,10 +68,31 @@ function cleanTitle(text) {
   return text.replace(/\s+/g, " ").trim().slice(0, 250);
 }
 
+function getChatKey(ctx) {
+  return String(ctx.message?.chat?.id || ctx.chat?.id || "default");
+}
+
+function getSenderName(ctx) {
+  const user = ctx.message?.from;
+  if (!user) return "Unknown user";
+
+  const fullName = `${user.first_name || ""} ${user.last_name || ""}`.trim();
+  const username = user.username ? `@${user.username}` : "";
+
+  return `${fullName || "No name"} ${username}`.trim();
+}
+
+function getChatName(ctx) {
+  const chat = ctx.message?.chat;
+  if (!chat) return "Unknown chat";
+  if (chat.type === "private") return "Private chat";
+  return chat.title || "Unknown group";
+}
+
 function getForwardedFrom(ctx) {
   const origin = ctx.message?.forward_origin;
 
-  if (!origin) return "Nu este mesaj forwardat";
+  if (!origin) return "Not a forwarded message";
 
   if (origin.type === "user") {
     const user = origin.sender_user;
@@ -78,34 +100,54 @@ function getForwardedFrom(ctx) {
   }
 
   if (origin.type === "chat") {
-    return origin.chat.title || "Chat necunoscut";
+    return origin.chat.title || "Unknown chat";
   }
 
   if (origin.type === "channel") {
-    return origin.chat.title || "Canal necunoscut";
+    return origin.chat.title || "Unknown channel";
   }
 
-  return "Sursă necunoscută";
+  return "Unknown source";
 }
 
-async function getTelegramPhotoUrl(ctx) {
-  const photos = ctx.message?.photo;
-
-  if (!photos || photos.length === 0) return null;
-
-  const largestPhoto = photos[photos.length - 1];
-  const fileLink = await ctx.telegram.getFileLink(largestPhoto.file_id);
-
-  return fileLink.href;
+function hasSupportedImage(ctx) {
+  return Boolean(
+    ctx.message?.photo?.length ||
+      ctx.message?.document?.mime_type?.startsWith("image/")
+  );
 }
 
-async function uploadTelegramImageToCloudinary(photoUrl) {
-  const response = await axios.get(photoUrl, {
+function isCommand(text, names) {
+  const normalized = text.toLowerCase().trim();
+  const base = normalized.split("@")[0];
+  return names.some((name) => base === name || normalized === name);
+}
+
+async function getTelegramImageUrl(ctx) {
+  if (ctx.message?.photo?.length) {
+    const largestPhoto = ctx.message.photo[ctx.message.photo.length - 1];
+    const fileLink = await ctx.telegram.getFileLink(largestPhoto.file_id);
+    return fileLink.href;
+  }
+
+  const doc = ctx.message?.document;
+
+  if (doc && doc.mime_type?.startsWith("image/")) {
+    const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+    return fileLink.href;
+  }
+
+  return null;
+}
+
+async function uploadTelegramImageToCloudinary(imageUrl) {
+  const response = await axios.get(imageUrl, {
     responseType: "arraybuffer",
   });
 
+  const mimeType = response.headers["content-type"] || "image/jpeg";
   const base64Image = Buffer.from(response.data).toString("base64");
-  const dataUri = `data:image/jpeg;base64,${base64Image}`;
+  const dataUri = `data:${mimeType};base64,${base64Image}`;
 
   const result = await cloudinary.uploader.upload(dataUri, {
     folder: "telegram-github-bot",
@@ -143,29 +185,6 @@ async function createIssue(title, body) {
   );
 
   return result.createIssue.issue;
-}
-
-async function addCommentToIssue(issueId, body) {
-  await github(
-    `
-    mutation($issueId: ID!, $body: String!) {
-      addComment(input: {
-        subjectId: $issueId,
-        body: $body
-      }) {
-        commentEdge {
-          node {
-            id
-          }
-        }
-      }
-    }
-    `,
-    {
-      issueId,
-      body,
-    }
-  );
 }
 
 async function addIssueToProject(issueId) {
@@ -225,82 +244,232 @@ async function setStatusToBacklog(itemId) {
 
 async function createBacklogTask(ctx) {
   const text = getTaskText(ctx);
-  const hasPhoto = Boolean(ctx.message?.photo?.length);
-
-  const title = cleanTitle(text || "Imagine forwardată");
+  const senderName = getSenderName(ctx);
+  const chatName = getChatName(ctx);
   const forwardedFrom = getForwardedFrom(ctx);
-  const telegramPhotoUrl = await getTelegramPhotoUrl(ctx);
-
-  const issueBody = `Forwarded from: ${forwardedFrom}
-
-Original message:
-${text || "Fără text"}`;
-
-  const issue = await createIssue(title, issueBody);
+  const telegramImageUrl = await getTelegramImageUrl(ctx);
 
   let publicImageUrl = null;
 
-  if (telegramPhotoUrl) {
-    publicImageUrl = await uploadTelegramImageToCloudinary(telegramPhotoUrl);
-
-    const imageComment = `<img width="884" alt="Image" src="${publicImageUrl}" />`;
-
-    await addCommentToIssue(issue.id, imageComment);
+  if (telegramImageUrl) {
+    publicImageUrl = await uploadTelegramImageToCloudinary(telegramImageUrl);
   }
+
+  const titlePrefix = chatName !== "Private chat" ? `[${chatName}] ` : "";
+  const title = cleanTitle(`${titlePrefix}${text || "Image sent"}`);
+
+  const issueBody = `Chat: ${chatName}
+Sent by: ${senderName}
+Forwarded from: ${forwardedFrom}
+
+Original message:
+${text || "No text"}
+
+${publicImageUrl ? `<img width="884" alt="Image" src="${publicImageUrl}" />` : ""}`;
+
+  const issue = await createIssue(title, issueBody);
 
   const itemId = await addIssueToProject(issue.id);
   await setStatusToBacklog(itemId);
 
   return {
     issue,
+    senderName,
+    chatName,
     forwardedFrom,
     publicImageUrl,
-    hasPhoto,
   };
+}
+
+function startCombineSession(ctx) {
+  const chatKey = getChatKey(ctx);
+
+  combineSessions.set(chatKey, {
+    chatId: ctx.chat.id,
+    chatName: getChatName(ctx),
+    startedBy: getSenderName(ctx),
+    items: [],
+    creating: false,
+  });
+}
+
+function cancelCombineSession(ctx) {
+  const chatKey = getChatKey(ctx);
+  combineSessions.delete(chatKey);
+}
+
+async function addMessageToCombineSession(ctx) {
+  const chatKey = getChatKey(ctx);
+  const session = combineSessions.get(chatKey);
+
+  if (!session || session.creating) return false;
+
+  const text = getTaskText(ctx);
+  const telegramImageUrl = await getTelegramImageUrl(ctx);
+
+  session.items.push({
+    text,
+    senderName: getSenderName(ctx),
+    chatName: getChatName(ctx),
+    forwardedFrom: getForwardedFrom(ctx),
+    telegramImageUrl,
+    hasImage: hasSupportedImage(ctx),
+  });
+
+  return true;
+}
+
+async function createCombinedBacklogTask(ctx) {
+  const chatKey = getChatKey(ctx);
+  const session = combineSessions.get(chatKey);
+
+  if (!session || session.items.length === 0 || session.creating) {
+    return null;
+  }
+
+  session.creating = true;
+
+  const preparedItems = [];
+
+  for (let i = 0; i < session.items.length; i++) {
+    const item = session.items[i];
+
+    let publicImageUrl = null;
+
+    if (item.telegramImageUrl) {
+      try {
+        publicImageUrl = await uploadTelegramImageToCloudinary(
+          item.telegramImageUrl
+        );
+      } catch (error) {
+        console.error(`Image upload failed ${i + 1}:`, error);
+      }
+    }
+
+    preparedItems.push({
+      ...item,
+      publicImageUrl,
+    });
+  }
+
+  const firstTextItem = preparedItems.find((item) => item.text);
+  const titleText = firstTextItem?.text || "Combined images";
+  const title = cleanTitle(`[${session.chatName}] ${titleText}`);
+
+  const issueBody = `Chat: ${session.chatName}
+Started by: ${session.startedBy}
+Combined messages: ${preparedItems.length}
+
+${preparedItems
+  .map((item, index) => {
+    return `--- Message ${index + 1} ---
+Sent by: ${item.senderName}
+Forwarded from: ${item.forwardedFrom}
+Has image: ${item.publicImageUrl ? "Yes" : "No"}
+
+Original message:
+${item.text || "No text"}
+
+${item.publicImageUrl ? `<img width="884" alt="Image" src="${item.publicImageUrl}" />` : ""}`;
+  })
+  .join("\n\n")}`;
+
+  const issue = await createIssue(title, issueBody);
+
+  const itemId = await addIssueToProject(issue.id);
+  await setStatusToBacklog(itemId);
+
+  combineSessions.delete(chatKey);
+
+  return issue;
 }
 
 bot.start((ctx) => {
   ctx.reply(
-    "Bot activ ✅\n\nTrimite sau forwardează text/poză, iar eu creez task în GitHub Backlog."
+    "Bot active ✅\n\nWithout /combine each message becomes a separate task.\nWith /combine I collect messages, then /stop creates one combined task."
   );
 });
 
 bot.command("help", (ctx) => {
   ctx.reply(
-    "Trimite text sau forwardează o poză cu/fără caption. Botul creează issue în GitHub, îl pune în Backlog și adaugă imaginea direct în comentariu."
+    "Without /combine: each message/image becomes a separate task.\n\nWith /combine:\n1. Send /combine\n2. Forward messages/images\n3. Send /stop to create 1 combined task\n\nTo cancel without creating a task, send /cancel."
   );
 });
 
-bot.on(["text", "photo"], async (ctx) => {
+bot.on(["text", "photo", "document"], async (ctx) => {
   const rawText = getTaskText(ctx);
-  const hasPhoto = Boolean(ctx.message?.photo?.length);
+  const hasImage = hasSupportedImage(ctx);
 
-  if (rawText.startsWith("/")) return;
+  if (ctx.message?.from?.is_bot) return;
 
-  if (!rawText && !hasPhoto) {
-    return ctx.reply("⚠️ Mesajul nu conține text sau poză.");
+  // /combine or /combin
+  if (isCommand(rawText, ["/combine", "/combin"])) {
+    startCombineSession(ctx);
+    return ctx.reply(
+      "📌 Combine mode enabled.\nForward texts/images, then send /stop to create 1 task in Backlog."
+    );
   }
 
-  try {
-    await ctx.reply("⏳ Creez task în Backlog...");
+  // /cancel
+  if (isCommand(rawText, ["/cancel"])) {
+    cancelCombineSession(ctx);
+    return ctx.reply("🛑 Combine cancelled. No task was created.");
+  }
 
-    const { issue, forwardedFrom, publicImageUrl } =
+  // /stop
+  if (isCommand(rawText, ["/stop"])) {
+    try {
+      const issue = await createCombinedBacklogTask(ctx);
+
+      if (!issue) {
+        cancelCombineSession(ctx);
+        return ctx.reply("⚠️ No messages/images to combine.");
+      }
+
+      return ctx.reply(
+        `✅ Combined task added to Backlog:\n\n#${issue.number} ${issue.title}\n\n${issue.url}`
+      );
+    } catch (error) {
+      console.error("Combine stop error:", error);
+      cancelCombineSession(ctx);
+      return ctx.reply("❌ Error creating combined task.");
+    }
+  }
+
+  if (!rawText && !hasImage) return;
+
+  try {
+    const addedToCombine = await addMessageToCombineSession(ctx);
+
+    if (addedToCombine) {
+      const chatKey = getChatKey(ctx);
+      const session = combineSessions.get(chatKey);
+
+      return ctx.reply(
+        `➕ Added to combined task.\nTotal items: ${session.items.length}`
+      );
+    }
+
+    // Ignore other unknown commands
+    if (rawText.startsWith("/")) return;
+
+    const { issue, senderName, chatName, publicImageUrl } =
       await createBacklogTask(ctx);
 
     await ctx.reply(
-      `✅ Task adăugat în Backlog:\n\n#${issue.number} ${issue.title}\n📨 Forwarded from: ${forwardedFrom}${publicImageUrl ? "\n🖼 Imagine afișată în comentariu" : ""}\n\n${issue.url}`
+      `✅ Task added to Backlog:\n\n#${issue.number} ${issue.title}\n👤 From: ${senderName}\n💬 Chat: ${chatName}${publicImageUrl ? "\n🖼 Image shown in task" : ""}\n\n${issue.url}`
     );
   } catch (error) {
     console.error("GitHub/Telegram error:", error);
 
     await ctx.reply(
-      "❌ Eroare la crearea taskului. Verifică tokenurile GitHub, Telegram și Cloudinary."
+      "❌ Error creating task. Check GitHub, Telegram and Cloudinary tokens."
     );
   }
 });
 
-bot.on("message", async (ctx) => {
-  await ctx.reply("⚠️ Mesaj nesuportat. Trimite text sau poză.");
+bot.on("message", async () => {
+  return;
 });
 
 bot.catch((err) => {
