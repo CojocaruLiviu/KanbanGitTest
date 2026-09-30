@@ -37,7 +37,6 @@ const github = graphql.defaults({
 });
 
 let repositoryIdCache = null;
-const combineSessions = new Map();
 
 async function getRepositoryId() {
   if (repositoryIdCache) return repositoryIdCache;
@@ -118,9 +117,13 @@ function hasSupportedImage(ctx) {
 }
 
 function isCommand(text, names) {
-  const normalized = text.toLowerCase().trim();
+  const normalized = (text || "").toLowerCase().trim();
   const base = normalized.split("@")[0];
   return names.some((name) => base === name || normalized === name);
+}
+
+function sessionMarker(chatKey) {
+  return `[combine-session:${chatKey}]`;
 }
 
 async function getTelegramImageUrl(ctx) {
@@ -185,6 +188,208 @@ async function createIssue(title, body) {
   );
 
   return result.createIssue.issue;
+}
+
+async function addCommentToIssue(issueId, body) {
+  const result = await github(
+    `
+    mutation($issueId: ID!, $body: String!) {
+      addComment(input: {
+        subjectId: $issueId,
+        body: $body
+      }) {
+        commentEdge {
+          node {
+            id
+            body
+          }
+        }
+      }
+    }
+    `,
+    {
+      issueId,
+      body,
+    }
+  );
+
+  return result.addComment.commentEdge.node;
+}
+
+async function closeIssue(issueId) {
+  await github(
+    `
+    mutation($issueId: ID!) {
+      closeIssue(input: { issueId: $issueId }) {
+        issue {
+          id
+        }
+      }
+    }
+    `,
+    { issueId }
+  );
+}
+
+async function findOpenCombineSession(chatKey) {
+  const marker = sessionMarker(chatKey);
+  const owner = process.env.GITHUB_OWNER;
+  const repo = process.env.GITHUB_REPO;
+
+  const data = await github(
+    `
+    query($owner: String!, $repo: String!) {
+      repository(owner: $owner, name: $repo) {
+        issues(
+          first: 20
+          states: OPEN
+          orderBy: { field: CREATED_AT, direction: DESC }
+        ) {
+          nodes {
+            id
+            number
+            title
+            body
+            comments(first: 50) {
+              nodes {
+                body
+              }
+            }
+          }
+        }
+      }
+    }
+    `,
+    {
+      owner,
+      repo,
+    }
+  );
+
+  const issues = data.repository.issues.nodes || [];
+  return issues.find((issue) => issue.title.includes(marker)) || null;
+}
+
+async function startCombineSession(ctx) {
+  const chatKey = getChatKey(ctx);
+  const chatName = getChatName(ctx);
+  const startedBy = getSenderName(ctx);
+  const marker = sessionMarker(chatKey);
+
+  const existing = await findOpenCombineSession(chatKey);
+  if (existing) {
+    await closeIssue(existing.id);
+  }
+
+  const issue = await createIssue(
+    `🔄 ${marker}`,
+    `Chat: ${chatName}\nStarted by: ${startedBy}\n\n_Temporary combine session – will be closed on /stop or /cancel._`
+  );
+
+  return issue;
+}
+
+async function cancelCombineSession(ctx) {
+  const chatKey = getChatKey(ctx);
+  const existing = await findOpenCombineSession(chatKey);
+
+  if (existing) {
+    await closeIssue(existing.id);
+    return true;
+  }
+
+  return false;
+}
+
+async function addMessageToCombineSession(ctx) {
+  const chatKey = getChatKey(ctx);
+  const session = await findOpenCombineSession(chatKey);
+
+  if (!session) return null;
+
+  const text = getTaskText(ctx);
+  const telegramImageUrl = await getTelegramImageUrl(ctx);
+
+  let publicImageUrl = null;
+  if (telegramImageUrl) {
+    try {
+      publicImageUrl = await uploadTelegramImageToCloudinary(telegramImageUrl);
+    } catch (error) {
+      console.error("Image upload failed:", error);
+    }
+  }
+
+  const item = {
+    text: text || "",
+    senderName: getSenderName(ctx),
+    chatName: getChatName(ctx),
+    forwardedFrom: getForwardedFrom(ctx),
+    publicImageUrl,
+  };
+
+  await addCommentToIssue(session.id, "```json\n" + JSON.stringify(item) + "\n```");
+
+  const itemCount = (session.comments?.nodes?.length || 0) + 1;
+  return itemCount;
+}
+
+async function createCombinedBacklogTask(ctx) {
+  const chatKey = getChatKey(ctx);
+  const session = await findOpenCombineSession(chatKey);
+
+  if (!session) return null;
+
+  const comments = session.comments?.nodes || [];
+  const preparedItems = [];
+
+  for (const comment of comments) {
+    try {
+      const match = comment.body.match(/```json\n([\s\S]*?)\n```/);
+      if (match) {
+        preparedItems.push(JSON.parse(match[1]));
+      }
+    } catch (error) {
+      console.error("Failed to parse combine item:", error);
+    }
+  }
+
+  if (preparedItems.length === 0) {
+    await closeIssue(session.id);
+    return null;
+  }
+
+  const chatName = preparedItems[0]?.chatName || getChatName(ctx);
+  const startedBy = getSenderName(ctx);
+  const firstTextItem = preparedItems.find((item) => item.text);
+  const titleText = firstTextItem?.text || "Combined images";
+  const title = cleanTitle(`[${chatName}] ${titleText}`);
+
+  const issueBody = `Chat: ${chatName}
+Started by: ${startedBy}
+Combined messages: ${preparedItems.length}
+
+${preparedItems
+  .map((item, index) => {
+    return `--- Message ${index + 1} ---
+Sent by: ${item.senderName}
+Forwarded from: ${item.forwardedFrom}
+Has image: ${item.publicImageUrl ? "Yes" : "No"}
+
+Original message:
+${item.text || "No text"}
+
+${item.publicImageUrl ? '<img width="884" alt="Image" src="' + item.publicImageUrl + '" />' : ""}`;
+  })
+  .join("\n\n")}`;
+
+  const issue = await createIssue(title, issueBody);
+
+  const itemId = await addIssueToProject(issue.id);
+  await setStatusToBacklog(itemId);
+
+  await closeIssue(session.id);
+
+  return issue;
 }
 
 async function addIssueToProject(issueId) {
@@ -265,7 +470,7 @@ Forwarded from: ${forwardedFrom}
 Original message:
 ${text || "No text"}
 
-${publicImageUrl ? `<img width="884" alt="Image" src="${publicImageUrl}" />` : ""}`;
+${publicImageUrl ? '<img width="884" alt="Image" src="' + publicImageUrl + '" />' : ""}`;
 
   const issue = await createIssue(title, issueBody);
 
@@ -279,109 +484,6 @@ ${publicImageUrl ? `<img width="884" alt="Image" src="${publicImageUrl}" />` : "
     forwardedFrom,
     publicImageUrl,
   };
-}
-
-function startCombineSession(ctx) {
-  const chatKey = getChatKey(ctx);
-
-  combineSessions.set(chatKey, {
-    chatId: ctx.chat.id,
-    chatName: getChatName(ctx),
-    startedBy: getSenderName(ctx),
-    items: [],
-    creating: false,
-  });
-}
-
-function cancelCombineSession(ctx) {
-  const chatKey = getChatKey(ctx);
-  combineSessions.delete(chatKey);
-}
-
-async function addMessageToCombineSession(ctx) {
-  const chatKey = getChatKey(ctx);
-  const session = combineSessions.get(chatKey);
-
-  if (!session || session.creating) return false;
-
-  const text = getTaskText(ctx);
-  const telegramImageUrl = await getTelegramImageUrl(ctx);
-
-  session.items.push({
-    text,
-    senderName: getSenderName(ctx),
-    chatName: getChatName(ctx),
-    forwardedFrom: getForwardedFrom(ctx),
-    telegramImageUrl,
-    hasImage: hasSupportedImage(ctx),
-  });
-
-  return true;
-}
-
-async function createCombinedBacklogTask(ctx) {
-  const chatKey = getChatKey(ctx);
-  const session = combineSessions.get(chatKey);
-
-  if (!session || session.items.length === 0 || session.creating) {
-    return null;
-  }
-
-  session.creating = true;
-
-  const preparedItems = [];
-
-  for (let i = 0; i < session.items.length; i++) {
-    const item = session.items[i];
-
-    let publicImageUrl = null;
-
-    if (item.telegramImageUrl) {
-      try {
-        publicImageUrl = await uploadTelegramImageToCloudinary(
-          item.telegramImageUrl
-        );
-      } catch (error) {
-        console.error(`Image upload failed ${i + 1}:`, error);
-      }
-    }
-
-    preparedItems.push({
-      ...item,
-      publicImageUrl,
-    });
-  }
-
-  const firstTextItem = preparedItems.find((item) => item.text);
-  const titleText = firstTextItem?.text || "Combined images";
-  const title = cleanTitle(`[${session.chatName}] ${titleText}`);
-
-  const issueBody = `Chat: ${session.chatName}
-Started by: ${session.startedBy}
-Combined messages: ${preparedItems.length}
-
-${preparedItems
-  .map((item, index) => {
-    return `--- Message ${index + 1} ---
-Sent by: ${item.senderName}
-Forwarded from: ${item.forwardedFrom}
-Has image: ${item.publicImageUrl ? "Yes" : "No"}
-
-Original message:
-${item.text || "No text"}
-
-${item.publicImageUrl ? `<img width="884" alt="Image" src="${item.publicImageUrl}" />` : ""}`;
-  })
-  .join("\n\n")}`;
-
-  const issue = await createIssue(title, issueBody);
-
-  const itemId = await addIssueToProject(issue.id);
-  await setStatusToBacklog(itemId);
-
-  combineSessions.delete(chatKey);
-
-  return issue;
 }
 
 bot.start((ctx) => {
@@ -402,28 +504,38 @@ bot.on(["text", "photo", "document"], async (ctx) => {
 
   if (ctx.message?.from?.is_bot) return;
 
-  // /combine or /combin
   if (isCommand(rawText, ["/combine", "/combin"])) {
-    startCombineSession(ctx);
-    return ctx.reply(
-      "📌 Combine mode enabled.\nForward texts/images, then send /stop to create 1 task in Backlog."
-    );
+    try {
+      await startCombineSession(ctx);
+      return ctx.reply(
+        "📌 Combine mode enabled.\nForward texts/images, then send /stop to create 1 task in Backlog."
+      );
+    } catch (error) {
+      console.error("Combine start error:", error);
+      return ctx.reply("❌ Error starting combine mode.");
+    }
   }
 
-  // /cancel
   if (isCommand(rawText, ["/cancel"])) {
-    cancelCombineSession(ctx);
-    return ctx.reply("🛑 Combine cancelled. No task was created.");
+    try {
+      const cancelled = await cancelCombineSession(ctx);
+      if (cancelled) {
+        return ctx.reply("🛑 Combine cancelled. No task was created.");
+      }
+      return ctx.reply("⚠️ No active combine session.");
+    } catch (error) {
+      console.error("Combine cancel error:", error);
+      return ctx.reply("❌ Error cancelling combine mode.");
+    }
   }
 
-  // /stop
   if (isCommand(rawText, ["/stop"])) {
     try {
+      await ctx.reply("⏳ Creating combined task...");
       const issue = await createCombinedBacklogTask(ctx);
 
       if (!issue) {
-        cancelCombineSession(ctx);
-        return ctx.reply("⚠️ No messages/images to combine.");
+        return ctx.reply("⚠️ No messages/images to combine. Send /combine first.");
       }
 
       return ctx.reply(
@@ -431,7 +543,6 @@ bot.on(["text", "photo", "document"], async (ctx) => {
       );
     } catch (error) {
       console.error("Combine stop error:", error);
-      cancelCombineSession(ctx);
       return ctx.reply("❌ Error creating combined task.");
     }
   }
@@ -439,18 +550,14 @@ bot.on(["text", "photo", "document"], async (ctx) => {
   if (!rawText && !hasImage) return;
 
   try {
-    const addedToCombine = await addMessageToCombineSession(ctx);
+    const itemCount = await addMessageToCombineSession(ctx);
 
-    if (addedToCombine) {
-      const chatKey = getChatKey(ctx);
-      const session = combineSessions.get(chatKey);
-
+    if (itemCount !== null) {
       return ctx.reply(
-        `➕ Added to combined task.\nTotal items: ${session.items.length}`
+        `➕ Added to combined task.\nTotal items: ${itemCount}`
       );
     }
 
-    // Ignore other unknown commands
     if (rawText.startsWith("/")) return;
 
     const { issue, senderName, chatName, publicImageUrl } =
